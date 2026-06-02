@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#0a0a0f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="NearMe">
+<title>NearMe</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getAuth, GoogleAuthProvider, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+  import { getFirestore, doc, setDoc, getDoc, updateDoc, onSnapshot, collection, query, where, getDocs, deleteDoc, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyDemh-nL5sNtC3Ym0_tAmjKXAsTA5U3XUw",
+    authDomain: "nearme-b801c.firebaseapp.com",
+    projectId: "nearme-b801c",
+    storageBucket: "nearme-b801c.firebasestorage.app",
+    messagingSenderId: "19022309968",
+    appId: "1:19022309968:web:82f9a72c1fe4ecbd53bf55"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db = getFirestore(app);
+
+  let currentUser = null;
+  let map = null;
+  let friendMarkers = {};
+  let myMarker = null;
+  let watchId = null;
+  let friendUnsubs = {};
+  let requestsUnsub = null;
+  let isGhost = false;
+  let authReady = false;
+
+  // ─── AUTH — redirect result FIRST, then state listener ───
+  showToast("Loading...");
+
+  getRedirectResult(auth).then(result => {
+    if (result?.user) {
+      // Coming back from Google redirect — login succeeded
+      onUserLogin(result.user);
+    } else {
+      // Not a redirect return — let onAuthStateChanged handle it
+      listenAuthState();
+    }
+  }).catch(e => {
+    console.error("Redirect error:", e);
+    showToast("Sign in error: " + e.message);
+    listenAuthState();
+  });
+
+  function listenAuthState() {
+    onAuthStateChanged(auth, user => {
+      if (authReady) return; // prevent double fire
+      authReady = true;
+      if (user) {
+        onUserLogin(user);
+      } else {
+        showScreen('login');
+      }
+    });
+  }
+
+  window.loginWithGoogle = async function() {
+    try {
+      showToast("Redirecting to Google...");
+      const provider = new GoogleAuthProvider();
+      await signInWithRedirect(auth, provider);
+    } catch(e) {
+      showToast("Sign in failed: " + e.message);
+    }
+  };
+
+  window.logout = async function() {
+    stopTracking();
+    authReady = false;
+    await signOut(auth);
+    showScreen('login');
+  };
+
+  async function onUserLogin(user) {
+    if (currentUser) return; // prevent double call
+    currentUser = user;
+    authReady = true;
+
+    await setDoc(doc(db, 'users', user.uid), {
+      uid: user.uid,
+      name: user.displayName,
+      email: user.email,
+      photo: user.photoURL || '',
+      ghost: false,
+      updatedAt: serverTimestamp()
+    }, { merge: true });
+
+    showScreen('friends');
+    startTracking();
+    loadFriends();
+    listenRequests();
+  }
+
+  // ─── LOCATION ───
+  function startTracking() {
+    if (!navigator.geolocation) return showToast("Geolocation not supported");
+    watchId = navigator.geolocation.watchPosition(async pos => {
+      if (!currentUser || isGhost) return;
+      await updateDoc(doc(db, 'users', currentUser.uid), {
+        location: { lat: pos.coords.latitude, lng: pos.coords.longitude },
+        updatedAt: serverTimestamp()
+      });
+    }, err => showToast("Location: " + err.message),
+    { enableHighAccuracy: true, maximumAge: 10000, timeout: 15000 });
+  }
+
+  function stopTracking() {
+    if (watchId) navigator.geolocation.clearWatch(watchId);
+    watchId = null;
+    Object.values(friendUnsubs).forEach(u => u());
+    friendUnsubs = {};
+    if (requestsUnsub) { requestsUnsub(); requestsUnsub = null; }
+  }
+
+  // ─── GHOST MODE ───
+  window.toggleGhost = async function() {
+    isGhost = !isGhost;
+    const badge = document.getElementById('ghost-badge');
+    const text = document.getElementById('ghost-text');
+    const banner = document.getElementById('ghost-banner');
+    if (isGhost) {
+      badge.textContent = 'GHOST'; badge.style.background = 'var(--ghost)';
+      text.textContent = "Ghost mode ON — friends can't see you";
+      banner.style.borderColor = '#ff950044';
+      await updateDoc(doc(db, 'users', currentUser.uid), { location: null, ghost: true });
+    } else {
+      badge.textContent = 'LIVE'; badge.style.background = 'var(--accent)';
+      text.textContent = "You're visible to friends";
+      banner.style.borderColor = '#00f5a022';
+      await updateDoc(doc(db, 'users', currentUser.uid), { ghost: false });
+      startTracking();
+    }
+  };
+
+  // ─── FRIENDS ───
+  async function loadFriends() {
+    const snap = await getDocs(collection(db, 'users', currentUser.uid, 'friends'));
+    const list = document.getElementById('friends-list');
+    list.innerHTML = '';
+    if (snap.empty) {
+      list.innerHTML = '<div class="empty-state">No friends yet.<br>Tap Add to invite someone.</div>';
+      return;
+    }
+    snap.forEach(fdoc => listenFriend(fdoc.id));
+  }
+
+  function listenFriend(friendId) {
+    if (friendUnsubs[friendId]) return;
+    friendUnsubs[friendId] = onSnapshot(doc(db, 'users', friendId), snap => {
+      if (!snap.exists()) return;
+      updateFriendCard(friendId, snap.data());
+      updateFriendPin(friendId, snap.data());
+    });
+  }
+
+  function updateFriendCard(friendId, data) {
+    const list = document.getElementById('friends-list');
+    let card = document.getElementById('fc-' + friendId);
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'friend-card';
+      card.id = 'fc-' + friendId;
+      list.appendChild(card);
+    }
+
+    const initial = (data.name || '?')[0].toUpperCase();
+    const gradients = ['#00f5a0,#00c8ff','#ff6b6b,#ff9500','#a855f7,#ec4899','#3b82f6,#06b6d4','#f59e0b,#ef4444'];
+    const [c1,c2] = gradients[friendId.charCodeAt(0) % gradients.length].split(',');
+
+    let distText = '—', distClass = 'offline-dist', statusClass = 'offline', locText = '🔴 Offline';
+    if (data.ghost) { distClass='ghost-dist'; statusClass='ghost'; locText='👻 Ghost Mode ON'; }
+    else if (data.location) { distClass='green-dist'; statusClass='online'; locText='📍 Location shared'; }
+
+    card.innerHTML = `
+      <div style="width:48px;height:48px;border-radius:16px;background:linear-gradient(135deg,${c1},${c2});display:flex;align-items:center;justify-content:center;font-family:'Syne',sans-serif;font-weight:800;font-size:18px;color:#fff;position:relative;flex-shrink:0;overflow:hidden;">
+        ${data.photo ? `<img src="${data.photo}" style="width:100%;height:100%;object-fit:cover;">` : initial}
+        <div class="status-dot ${statusClass}"></div>
+      </div>
+      <div class="friend-info">
+        <div class="friend-name">${data.name||'Unknown'}</div>
+        <div class="friend-location">${locText}</div>
+      </div>
+      <div class="friend-right">
+        <div class="friend-dist ${distClass}" id="dist-${friendId}">${distText}</div>
+        <div class="friend-time">${data.ghost?'hidden':data.location?'live':'offline'}</div>
+      </div>`;
+
+    if (data.location && !data.ghost) {
+      navigator.geolocation.getCurrentPosition(pos => {
+        const d = calcDist(pos.coords.latitude, pos.coords.longitude, data.location.lat, data.location.lng);
+        const el = document.getElementById('dist-' + friendId);
+        if (el) el.textContent = d < 1 ? Math.round(d*1000)+'m' : d.toFixed(1)+' km';
+      });
+    }
+
+    card.onclick = () => data.location && !data.ghost ? openFriendOnMap(friendId, data) : showToast((data.name||'Friend')+' is not sharing location');
+  }
+
+  function updateFriendPin(friendId, data) {
+    if (!map) return;
+    if (friendMarkers[friendId]) { map.removeLayer(friendMarkers[friendId]); delete friendMarkers[friendId]; }
+    if (!data.location || data.ghost) return;
+    const initial = (data.name||'?')[0].toUpperCase();
+    const colors = ['#00f5a0','#ff6b6b','#a855f7','#3b82f6','#f59e0b'];
+    const color = colors[friendId.charCodeAt(0) % colors.length];
+    const icon = L.divIcon({
+      className:'',
+      html:`<div style="display:flex;flex-direction:column;align-items:center;">
+        <div style="width:44px;height:44px;border-radius:14px;background:${color};border:3px solid #fff;display:flex;align-items:center;justify-content:center;font-family:'Syne',sans-serif;font-weight:800;font-size:16px;color:#000;box-shadow:0 4px 16px #0006;">${initial}</div>
+        <div style="width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-top:10px solid #fff;margin-top:-1px;"></div>
+        <div style="background:#000c;color:#fff;font-size:10px;font-weight:600;padding:2px 7px;border-radius:20px;margin-top:3px;white-space:nowrap;">${(data.name||'').split(' ')[0]}</div>
+      </div>`,
+      iconSize:[60,80], iconAnchor:[30,80]
+    });
+    const marker = L.marker([data.location.lat, data.location.lng], {icon});
+    marker.on('click', () => openSheet(data));
+    marker.addTo(map);
+    friendMarkers[friendId] = marker;
+  }
+
+  function openFriendOnMap(friendId, data) {
+    showScreen('map');
+    setTimeout(() => {
+      initMap();
+      if (data.location) { map.setView([data.location.lat, data.location.lng], 15); openSheet(data); }
+    }, 200);
+  }
+
+  // ─── MAP ───
+  window.initMap = function() {
+    if (map) return;
+    map = L.map('map-div', {zoomControl:false, attributionControl:false}).setView([-1.3731, 36.7894], 14);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19}).addTo(map);
+    navigator.geolocation.getCurrentPosition(pos => {
+      const {latitude:lat, longitude:lng} = pos.coords;
+      const youIcon = L.divIcon({
+        className:'',
+        html:`<div style="display:flex;flex-direction:column;align-items:center;">
+          <div style="width:20px;height:20px;border-radius:50%;background:#00f5a0;border:3px solid #fff;box-shadow:0 0 0 8px #00f5a030;"></div>
+          <div style="background:#00f5a0;color:#000;font-size:9px;font-weight:800;font-family:'Syne',sans-serif;padding:2px 6px;border-radius:20px;margin-top:3px;">YOU</div>
+        </div>`,
+        iconSize:[40,40], iconAnchor:[20,20]
+      });
+      myMarker = L.marker([lat,lng],{icon:youIcon}).addTo(map);
+      map.setView([lat,lng],14);
+    });
+    Object.keys(friendUnsubs).forEach(fid => {
+      getDoc(doc(db,'users',fid)).then(s => { if(s.exists()) updateFriendPin(fid, s.data()); });
+    });
+  };
+
+  // ─── SHEET ───
+  let sheetData = null;
+  function openSheet(data) {
+    sheetData = data;
+    document.getElementById('sheet-name').textContent = data.name;
+    document.getElementById('sheet-loc').textContent = '📍 Location shared';
+    document.getElementById('sheet-dist').textContent = '...';
+    const av = document.getElementById('sheet-av');
+    av.style.background = 'linear-gradient(135deg,#00f5a0,#00c8ff)';
+    av.textContent = (data.name||'?')[0].toUpperCase();
+    if (data.photo) av.innerHTML = `<img src="${data.photo}" style="width:100%;height:100%;border-radius:18px;object-fit:cover;">`;
+    if (data.location) {
+      navigator.geolocation.getCurrentPosition(pos => {
+        const d = calcDist(pos.coords.latitude, pos.coords.longitude, data.location.lat, data.location.lng);
+        document.getElementById('sheet-dist').textContent = d < 1 ? Math.round(d*1000)+'m' : d.toFixed(1)+' km';
+      });
+    }
+    document.getElementById('map-sheet').classList.add('open');
+  }
+  window.closeSheet = () => document.getElementById('map-sheet').classList.remove('open');
+  window.navigateToFriend = () => {
+    if (!sheetData?.location) return;
+    window.open(`https://www.google.com/maps/dir/?api=1&destination=${sheetData.location.lat},${sheetData.location.lng}`, '_blank');
+  };
+
+  // ─── REQUESTS ───
+  function listenRequests() {
+    requestsUnsub = onSnapshot(collection(db,'users',currentUser.uid,'requests'), snap => {
+      const count = snap.size;
+      document.getElementById('req-count').textContent = count + ' pending request' + (count!==1?'s':'');
+      const badge = document.getElementById('req-badge');
+      badge.textContent = count;
+      badge.style.display = count > 0 ? 'flex' : 'none';
+      const list = document.getElementById('req-list');
+      list.innerHTML = '';
+      if (snap.empty) { list.innerHTML='<div class="empty-state">No pending requests</div>'; return; }
+      snap.forEach(rdoc => {
+        const d = rdoc.data();
+        const card = document.createElement('div');
+        card.className = 'req-card';
+        card.innerHTML = `
+          <div class="req-top">
+            <div style="width:48px;height:48px;border-radius:16px;background:linear-gradient(135deg,#a855f7,#ec4899);display:flex;align-items:center;justify-content:center;font-family:'Syne',sans-serif;font-weight:800;font-size:18px;color:#fff;flex-shrink:0;overflow:hidden;">
+              ${d.photo?`<img src="${d.photo}" style="width:100%;height:100%;object-fit:cover;">`:(d.name||'?')[0].toUpperCase()}
+            </div>
+            <div class="req-info">
+              <div class="req-name">${d.name}</div>
+              <div class="req-sub">Wants to see your location</div>
+            </div>
+          </div>
+          <div class="req-actions">
+            <button class="req-accept" data-id="${rdoc.id}">✓ Accept</button>
+            <button class="req-decline" data-id="${rdoc.id}">✗ Decline</button>
+          </div>`;
+        card.querySelector('.req-accept').onclick = () => acceptRequest(rdoc.id, d);
+        card.querySelector('.req-decline').onclick = () => declineRequest(rdoc.id);
+        list.appendChild(card);
+      });
+    });
+  }
+
+  window.acceptRequest = async function(requesterId, data) {
+    await setDoc(doc(db,'users',currentUser.uid,'friends',requesterId),{uid:requesterId});
+    await setDoc(doc(db,'users',requesterId,'friends',currentUser.uid),{uid:currentUser.uid});
+    await deleteDoc(doc(db,'users',currentUser.uid,'requests',requesterId));
+    showToast((data.name||'Friend')+' added!');
+    loadFriends();
+  };
+
+  window.declineRequest = async function(requesterId) {
+    await deleteDoc(doc(db,'users',currentUser.uid,'requests',requesterId));
+    showToast('Request declined');
+  };
+
+  // ─── ADD FRIEND ───
+  window.sendFriendRequest = async function() {
+    const email = document.getElementById('add-email').value.trim();
+    if (!email) return showToast('Enter an email');
+    if (email === currentUser.email) return showToast("That's your own email!");
+    showToast('Searching...');
+    const q = query(collection(db,'users'), where('email','==',email));
+    const snap = await getDocs(q);
+    if (snap.empty) return showToast('No user found with that email');
+    const targetId = snap.docs[0].id;
+    const existing = await getDoc(doc(db,'users',currentUser.uid,'friends',targetId));
+    if (existing.exists()) return showToast('Already friends!');
+    await setDoc(doc(db,'users',targetId,'requests',currentUser.uid),{
+      uid: currentUser.uid, name: currentUser.displayName,
+      email: currentUser.email, photo: currentUser.photoURL||''
+    });
+    document.getElementById('add-email').value = '';
+    showToast('Friend request sent!');
+  };
+
+  // ─── UTILS ───
+  function calcDist(lat1,lng1,lat2,lng2) {
+    const R=6371, dL=(lat2-lat1)*Math.PI/180, dN=(lng2-lng1)*Math.PI/180;
+    const a=Math.sin(dL/2)**2+Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dN/2)**2;
+    return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+  }
+
+  function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.classList.add('show');
+    setTimeout(()=>t.classList.remove('show'), 3000);
+  }
+
+  window.showScreen = function(name) {
+    document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
+    document.getElementById('screen-'+name).classList.add('active');
+    if (name==='map') setTimeout(initMap, 100);
+    document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
+    const a = document.querySelector(`.nav-btn[data-screen="${name}"]`);
+    if (a) a.classList.add('active');
+  };
+
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(()=>{});
+</script>
+
+<style>
+  :root{--bg:#0a0a0f;--card:#13131a;--card2:#1a1a24;--border:#ffffff12;--accent:#00f5a0;--accent2:#00c8ff;--text:#f0f0f5;--muted:#6b6b80;--ghost:#ff9500;}
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{height:100%;overflow:hidden;}
+  body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;display:flex;flex-direction:column;}
+  .screen{display:none;flex-direction:column;height:100%;overflow:hidden;}
+  .screen.active{display:flex;}
+
+  #screen-login{align-items:center;justify-content:center;gap:32px;background:radial-gradient(ellipse at top,#00f5a015,var(--bg) 60%);padding:40px 24px;}
+  .login-logo{font-family:'Syne',sans-serif;font-weight:800;font-size:48px;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+  .login-sub{color:var(--muted);font-size:15px;text-align:center;line-height:1.6;}
+  .login-btn{width:100%;max-width:320px;padding:16px;background:#fff;border:none;border-radius:18px;font-family:'Syne',sans-serif;font-weight:700;font-size:16px;color:#000;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:12px;}
+  .login-btn img{width:22px;}
+
+  #screen-friends{background:var(--bg);}
+  .top-header{padding:56px 24px 12px;flex-shrink:0;}
+  .top-header h1{font-family:'Syne',sans-serif;font-size:28px;font-weight:800;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+  .top-header p{color:var(--muted);font-size:13px;margin-top:2px;}
+  .ghost-banner{margin:0 16px 12px;background:linear-gradient(135deg,#00f5a015,#00f5a005);border:1px solid #00f5a022;border-radius:14px;padding:12px 16px;display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text);cursor:pointer;flex-shrink:0;}
+  .ghost-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);animation:pg 2s infinite;flex-shrink:0;}
+  @keyframes pg{0%,100%{opacity:1}50%{opacity:0.3}}
+  #ghost-badge{background:var(--accent);color:#000;font-size:11px;font-weight:700;padding:4px 10px;border-radius:20px;font-family:'Syne',sans-serif;flex-shrink:0;}
+  .section-label{padding:0 24px 8px;font-size:11px;font-weight:600;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;flex-shrink:0;}
+  .friends-list{flex:1;overflow-y:auto;padding:0 16px 8px;scrollbar-width:none;}
+  .friends-list::-webkit-scrollbar{display:none;}
+  .friend-card{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;gap:14px;cursor:pointer;transition:all 0.2s;}
+  .friend-card:active{scale:0.98;background:var(--card2);}
+  .friend-info{flex:1;min-width:0;}
+  .friend-name{font-family:'Syne',sans-serif;font-weight:700;font-size:15px;}
+  .friend-location{font-size:12px;color:var(--muted);margin-top:2px;}
+  .friend-right{text-align:right;flex-shrink:0;}
+  .friend-dist{font-family:'Syne',sans-serif;font-weight:700;font-size:16px;}
+  .friend-dist.green-dist{background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+  .friend-dist.ghost-dist{color:var(--ghost);}
+  .friend-dist.offline-dist{color:var(--muted);}
+  .friend-time{font-size:11px;color:var(--muted);margin-top:2px;}
+  .status-dot{width:12px;height:12px;border-radius:50%;border:2px solid var(--card);position:absolute;bottom:-1px;right:-1px;}
+  .status-dot.online{background:#00f5a0;}
+  .status-dot.ghost{background:var(--ghost);}
+  .status-dot.offline{background:var(--muted);}
+  .empty-state{text-align:center;color:var(--muted);padding:40px 20px;line-height:1.8;font-size:14px;}
+
+  #screen-add{background:var(--bg);}
+  .add-header{padding:56px 24px 16px;flex-shrink:0;}
+  .add-header h2{font-family:'Syne',sans-serif;font-weight:800;font-size:24px;}
+  .add-header p{color:var(--muted);font-size:13px;margin-top:2px;}
+  .add-form{padding:0 16px 16px;flex-shrink:0;}
+  .add-input{width:100%;background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px 16px;color:var(--text);font-size:14px;font-family:'DM Sans',sans-serif;outline:none;margin-bottom:10px;}
+  .add-input:focus{border-color:var(--accent);}
+  .add-btn{width:100%;padding:14px;background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;border-radius:14px;font-family:'Syne',sans-serif;font-weight:700;font-size:15px;color:#000;cursor:pointer;}
+  .req-note{background:#00f5a00a;border:1px solid #00f5a020;border-radius:14px;padding:12px 16px;margin:0 16px 12px;font-size:12px;color:var(--muted);line-height:1.6;flex-shrink:0;}
+  .req-note strong{color:var(--accent);}
+  .req-list{flex:1;overflow-y:auto;padding:0 16px;scrollbar-width:none;}
+  .req-card{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:16px;margin-bottom:10px;}
+  .req-top{display:flex;align-items:center;gap:12px;margin-bottom:14px;}
+  .req-info{flex:1;}
+  .req-name{font-family:'Syne',sans-serif;font-weight:700;font-size:15px;}
+  .req-sub{font-size:12px;color:var(--muted);margin-top:2px;}
+  .req-actions{display:flex;gap:8px;}
+  .req-accept{flex:1;padding:11px;background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;border-radius:12px;font-family:'Syne',sans-serif;font-weight:700;font-size:13px;color:#000;cursor:pointer;}
+  .req-decline{flex:1;padding:11px;background:var(--card2);border:1px solid var(--border);border-radius:12px;font-family:'Syne',sans-serif;font-weight:600;font-size:13px;color:var(--muted);cursor:pointer;}
+
+  #screen-map{background:#0d1117;position:relative;}
+  #map-div{flex:1;z-index:1;}
+  .leaflet-tile{filter:brightness(0.7) saturate(0.8);}
+  .map-header{position:absolute;top:0;left:0;right:0;padding:50px 16px 16px;background:linear-gradient(to bottom,#0a0a0fee,transparent);display:flex;align-items:center;gap:12px;z-index:10;}
+  .back-btn{width:38px;height:38px;background:var(--card);border:1px solid var(--border);border-radius:12px;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;}
+  .map-title{font-family:'Syne',sans-serif;font-weight:700;font-size:16px;}
+  .bottom-sheet{position:absolute;bottom:70px;left:0;right:0;background:var(--card);border-radius:24px 24px 0 0;border-top:1px solid var(--border);padding:0 20px 24px;z-index:20;transform:translateY(100%);transition:transform 0.35s cubic-bezier(0.34,1.56,0.64,1);}
+  .bottom-sheet.open{transform:translateY(0);}
+  .sheet-handle{width:40px;height:4px;background:var(--border);border-radius:2px;margin:12px auto 20px;}
+  .sheet-friend{display:flex;align-items:center;gap:14px;margin-bottom:20px;}
+  .sheet-avatar{width:56px;height:56px;border-radius:18px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-family:'Syne',sans-serif;font-weight:800;font-size:20px;color:#000;flex-shrink:0;overflow:hidden;}
+  .sheet-name{font-family:'Syne',sans-serif;font-weight:700;font-size:18px;}
+  .sheet-location{font-size:13px;color:var(--muted);margin-top:3px;}
+  .sheet-stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px;}
+  .stat-box{background:var(--card2);border:1px solid var(--border);border-radius:16px;padding:14px;}
+  .stat-label{font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:1px;}
+  .stat-val{font-family:'Syne',sans-serif;font-weight:700;font-size:20px;}
+  .stat-val.green{background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+  .navigate-btn{width:100%;padding:16px;background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;border-radius:18px;font-family:'Syne',sans-serif;font-weight:700;font-size:16px;color:#000;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;}
+
+  .bottom-nav{padding:10px 16px 28px;display:flex;justify-content:space-around;align-items:center;background:var(--card);border-top:1px solid var(--border);flex-shrink:0;position:relative;z-index:30;}
+  .nav-btn{display:flex;flex-direction:column;align-items:center;gap:4px;cursor:pointer;padding:8px 16px;border-radius:14px;background:none;border:none;color:var(--muted);transition:all 0.2s;position:relative;}
+  .nav-btn.active{color:var(--accent);background:#00f5a015;}
+  .nav-btn svg{width:22px;height:22px;}
+  .nav-btn span{font-size:10px;font-weight:600;letter-spacing:0.5px;}
+  .fab{width:52px;height:52px;border-radius:18px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;cursor:pointer;border:none;box-shadow:0 8px 24px #00f5a040;}
+  .fab svg{width:24px;height:24px;color:#000;}
+  #req-badge{width:18px;height:18px;background:#ff4d6d;border-radius:50%;font-size:10px;font-weight:700;color:#fff;display:none;align-items:center;justify-content:center;position:absolute;top:4px;right:8px;}
+
+  #toast{position:fixed;bottom:100px;left:50%;transform:translateX(-50%) translateY(20px);background:#fff;color:#000;padding:10px 20px;border-radius:24px;font-size:13px;font-weight:600;opacity:0;transition:all 0.3s;z-index:999;white-space:nowrap;pointer-events:none;}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+</style>
+</head>
+<body>
+
+<div class="screen active" id="screen-login">
+  <div class="login-logo">NearMe</div>
+  <div class="login-sub">See where your friends are,<br>in real time. Always.</div>
+  <button class="login-btn" onclick="loginWithGoogle()">
+    <img src="https://www.google.com/favicon.ico" alt="G">
+    Continue with Google
+  </button>
+</div>
+
+<div class="screen" id="screen-friends">
+  <div class="top-header"><h1>NearMe</h1><p>Your friends, live</p></div>
+  <div class="ghost-banner" id="ghost-banner" onclick="toggleGhost()">
+    <div class="ghost-dot"></div>
+    <span id="ghost-text">You're visible to friends</span>
+    <div id="ghost-badge">LIVE</div>
+  </div>
+  <div class="section-label">Friends</div>
+  <div class="friends-list" id="friends-list"><div class="empty-state">Loading...</div></div>
+  <div class="bottom-nav">
+    <button class="nav-btn active" data-screen="friends" onclick="showScreen('friends')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      <span>Friends</span>
+    </button>
+    <button class="fab" onclick="showScreen('map')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="10" r="3"/><path d="M12 21.7C17.3 17 20 13 20 10a8 8 0 1 0-16 0c0 3 2.7 6.9 8 11.7z"/></svg>
+    </button>
+    <button class="nav-btn" data-screen="add" onclick="showScreen('add')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+      <div id="req-badge"></div>
+      <span>Add</span>
+    </button>
+  </div>
+</div>
+
+<div class="screen" id="screen-map">
+  <div class="map-header">
+    <div class="back-btn" onclick="showScreen('friends')">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+    </div>
+    <span class="map-title">Live Map</span>
+  </div>
+  <div id="map-div"></div>
+  <div class="bottom-sheet" id="map-sheet">
+    <div class="sheet-handle" onclick="closeSheet()"></div>
+    <div class="sheet-friend">
+      <div class="sheet-avatar" id="sheet-av"></div>
+      <div><div class="sheet-name" id="sheet-name"></div><div class="sheet-location" id="sheet-loc"></div></div>
+    </div>
+    <div class="sheet-stats">
+      <div class="stat-box"><div class="stat-label">Distance</div><div class="stat-val green" id="sheet-dist">—</div></div>
+      <div class="stat-box"><div class="stat-label">Status</div><div class="stat-val" style="font-size:14px;color:var(--accent);">🟢 Live</div></div>
+    </div>
+    <button class="navigate-btn" onclick="navigateToFriend()">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="3 11 22 2 13 21 11 13 3 11"/></svg>
+      Navigate with Google Maps
+    </button>
+  </div>
+  <div class="bottom-nav">
+    <button class="nav-btn" data-screen="friends" onclick="showScreen('friends')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      <span>Friends</span>
+    </button>
+    <button class="fab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="10" r="3"/><path d="M12 21.7C17.3 17 20 13 20 10a8 8 0 1 0-16 0c0 3 2.7 6.9 8 11.7z"/></svg></button>
+    <button class="nav-btn" data-screen="add" onclick="showScreen('add')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+      <span>Add</span>
+    </button>
+  </div>
+</div>
+
+<div class="screen" id="screen-add">
+  <div class="add-header"><h2>Add Friend</h2><p>Search by Gmail address</p></div>
+  <div class="add-form">
+    <input class="add-input" id="add-email" type="email" placeholder="friend@gmail.com">
+    <button class="add-btn" onclick="sendFriendRequest()">Send Friend Request</button>
+  </div>
+  <div class="req-note"><strong>Once accepted</strong> — both of you can see each other's live location anytime.</div>
+  <div class="section-label" style="padding-left:16px;" id="req-count">0 pending requests</div>
+  <div class="req-list" id="req-list"><div class="empty-state">No pending requests</div></div>
+  <div class="bottom-nav">
+    <button class="nav-btn" data-screen="friends" onclick="showScreen('friends')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      <span>Friends</span>
+    </button>
+    <button class="fab" onclick="showScreen('map')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="10" r="3"/><path d="M12 21.7C17.3 17 20 13 20 10a8 8 0 1 0-16 0c0 3 2.7 6.9 8 11.7z"/></svg></button>
+    <button class="nav-btn active" data-screen="add">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+      <span>Add</span>
+    </button>
+  </div>
+</div>
+
+<div id="toast"></div>
+</body>
+</html>
