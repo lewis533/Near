@@ -1,0 +1,13 @@
+{
+  "appId": "com.nearme.app",
+  "appName": "NearMe",
+  "webDir": ".",
+  "server": {
+    "androidScheme": "https"
+  },
+  "plugins": {
+    "Geolocation": {
+      "permissions": ["precise"]
+    }
+  }
+}
